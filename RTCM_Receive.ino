@@ -7,120 +7,96 @@ cd /Users/kikang/Desktop/ki/summershot/RTK/RTCM_Receive
 
 #include <RadioLib.h>
 
-// Define custom SPI pins
 #define CUSTOM_MOSI 12
 #define CUSTOM_MISO 13
 #define CUSTOM_SCLK 11
 #define CUSTOM_NSS 10
-#define CUSTOM_DIO1 4
-#define CUSTOM_NRST 6
-#define CUSTOM_BUSY 5
+#define CUSTOM_DIO1 2
+#define CUSTOM_NRST 4
+#define CUSTOM_BUSY 3
 
-// Define custom UART pins for GNSS
-#define RX_GNSS 8
-#define TX_GNSS 9
-
-// Create a custom SPI instance
-SPIClass customSPI(HSPI);  // Use VSPI or HSPI depending on your setup
-
-// Create an SX1280 instance with custom SPI
+SPIClass customSPI(HSPI);
 SX1280 radio = new Module(CUSTOM_NSS, CUSTOM_DIO1, CUSTOM_NRST, CUSTOM_BUSY, customSPI);
 
-// Use UART2 for GNSS
-HardwareSerial GNSS(2);  // Use Serial2 (UART2)
+// --- 덩어리 버퍼 ---
+#define MAX_STREAM_SIZE 8192
+uint8_t streamBuffer[MAX_STREAM_SIZE];
+size_t streamLen = 0;
+unsigned long lastPacketTime = 0;
+const unsigned long PACKET_TIMEOUT_MS = 100;
 
-// Timing for UART read
-unsigned long lastUartRead = 0;
-const unsigned long uartInterval = 1000;  // 1 second
-
-// Flag to indicate that a packet was received
 volatile bool receivedFlag = false;
 
-// ISR for packet received
-#if defined(ESP8266) || defined(ESP32)
-ICACHE_RAM_ATTR
-#endif
-void setFlag(void) {
+ICACHE_RAM_ATTR void setFlag() {
   receivedFlag = true;
 }
 
 void setup() {
-  Serial.begin(115200);  // Debug Serial
-  GNSS.begin(115200, SERIAL_8N1, RX_GNSS, TX_GNSS);  // GNSS Serial
-
-  Serial.println(F("[Setup] Initializing LoRa and GNSS UART..."));
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("=== RTCM 수신기 시작 ===");
 
   customSPI.begin(CUSTOM_SCLK, CUSTOM_MISO, CUSTOM_MOSI, CUSTOM_NSS);
-
-  Serial.print(F("[SX1280] Initializing ... "));
-  int state = radio.begin();
-  if (state == RADIOLIB_ERR_NONE) {
-    Serial.println(F("success!"));
-  } else {
-    Serial.print(F("failed, code "));
-    Serial.println(state);
-    while (true) { delay(10); }
+  if (radio.begin() != RADIOLIB_ERR_NONE) {
+    Serial.println("[LoRa] ❌ 초기화 실패");
+    while (true)
+      ;
   }
 
+  radio.setOutputPower(13);
+  radio.setFrequency(2400.0);
+  radio.setBandwidth(812.5);
+  radio.setSpreadingFactor(7);
   radio.setPacketReceivedAction(setFlag);
 
-  Serial.print(F("[SX1280] Starting to listen ... "));
-  state = radio.startReceive();
-  if (state == RADIOLIB_ERR_NONE) {
-    Serial.println(F("success!"));
-  } else {
-    Serial.print(F("failed, code "));
-    Serial.println(state);
-    while (true) { delay(10); }
-  }
+  radio.startReceive();
+  Serial.println("[LoRa] 수신 대기 중...");
 }
 
 void loop() {
-  // Handle LoRa packet reception
+  // 1️⃣ LoRa 패킷 수신
   if (receivedFlag) {
     receivedFlag = false;
 
-    String str;
-    int state = radio.readData(str);
+    uint8_t buffer[256];
+    int state = radio.readData(buffer, sizeof(buffer));
 
     if (state == RADIOLIB_ERR_NONE) {
-      Serial.println(F("[SX1280] Received packet!"));
-      Serial.print(F("[SX1280] Data:\t\t"));
-      Serial.println(str);
-      Serial.print(F("[SX1280] RSSI:\t\t"));
-      Serial.print(radio.getRSSI());
-      Serial.println(F(" dBm"));
-      Serial.print(F("[SX1280] SNR:\t\t"));
-      Serial.print(radio.getSNR());
-      Serial.println(F(" dB"));
-      Serial.print(F("[SX1280] Frequency Error:\t"));
-      Serial.print(radio.getFrequencyError());
-      Serial.println(F(" Hz"));
-    } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
-      Serial.println(F("CRC error!"));
+      size_t packetLen = radio.getPacketLength();
+
+      if (packetLen > 4) {
+        // streamBuffer 새로 시작 시 초기화
+        if (streamLen == 0) {
+          memset(streamBuffer, 0, MAX_STREAM_SIZE);
+        }
+
+        if (streamLen + packetLen - 4 < MAX_STREAM_SIZE) {
+          memcpy(streamBuffer + streamLen, buffer + 4, packetLen - 4);  // ✅ chunk 헤더 제거
+          streamLen += packetLen - 4;
+          lastPacketTime = millis();
+        } else {
+          Serial.println("[❌] streamBuffer overflow! 초기화");
+          streamLen = 0;
+        }
+      } else {
+        Serial.println("[⚠️] Skipped: not RTCM start");
+      }
     } else {
-      Serial.print(F("failed, code "));
-      Serial.println(state);
+      Serial.printf("[LoRa] ❌ 수신 실패 (%d)\n", state);
     }
 
-    // Restart receive mode
     radio.startReceive();
   }
 
-  // Handle GNSS UART reading every 1 second
-  if (millis() - lastUartRead >= uartInterval) {
-    lastUartRead = millis();
-
-    // Read and print GNSS UART data (non-blocking)
-    String gnssData = "";
-    while (GNSS.available()) {
-      char c = GNSS.read();
-      gnssData += c;
+  // 2️⃣ 덩어리 수신 완료 판단
+  if (streamLen > 0 && millis() - lastPacketTime > PACKET_TIMEOUT_MS) {
+    Serial.printf("\n[RTCM] ✅ 덩어리 수신 완료 (%zu bytes):\n[Hex] ", streamLen);
+    for (size_t i = 0; i < streamLen; i++) {
+      Serial.printf("%02X ", streamBuffer[i]);
+      if ((i + 1) % 32 == 0) Serial.println();
     }
+    Serial.println();
 
-    if (gnssData.length() > 0) {
-      Serial.println(F("[GNSS] UART Data:"));
-      Serial.println(gnssData);
-    }
+    streamLen = 0;  // 초기화
   }
 }
