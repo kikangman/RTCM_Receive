@@ -5,10 +5,10 @@ cd /Users/kikang/Desktop/ki/summershot/RTK/RTCM_Receive
 
 */
 
+
 #include <RadioLib.h>
 #include <TinyGPS++.h>
 
-// ---------- LoRa 핀 정의 ----------
 #define CUSTOM_MOSI 12
 #define CUSTOM_MISO 13
 #define CUSTOM_SCLK 11
@@ -17,15 +17,18 @@ cd /Users/kikang/Desktop/ki/summershot/RTK/RTCM_Receive
 #define CUSTOM_NRST 4
 #define CUSTOM_BUSY 3
 
-SPIClass customSPI(HSPI);
-SX1280 radio = new Module(CUSTOM_NSS, CUSTOM_DIO1, CUSTOM_NRST, CUSTOM_BUSY, customSPI);
-
-// ---------- GNSS UART ----------
 #define RX_GNSS 9
 #define TX_GNSS 8
-HardwareSerial GNSS(1);
 
-// ---------- RTCM 버퍼 ----------
+SPIClass customSPI(HSPI);
+SX1280 radio = new Module(CUSTOM_NSS, CUSTOM_DIO1, CUSTOM_NRST, CUSTOM_BUSY, customSPI);
+HardwareSerial GNSS(1);
+TinyGPSPlus gps;
+
+const int MAX_QUEUE_SIZE = 10;
+String locationQueue[MAX_QUEUE_SIZE];
+int queueStart = 0, queueEnd = 0, queueCount = 0;
+
 #define MAX_STREAM_SIZE 8192
 uint8_t streamBuffer[MAX_STREAM_SIZE];
 size_t streamLen = 0;
@@ -33,16 +36,12 @@ unsigned long lastPacketTime = 0;
 const unsigned long PACKET_TIMEOUT_MS = 100;
 volatile bool receivedFlag = false;
 
-// ---------- NMEA 파서 ----------
-TinyGPSPlus gps;
 String nmeaLine = "";
 
-// ---------- LoRa 수신 인터럽트 ----------
 ICACHE_RAM_ATTR void setFlag() {
   receivedFlag = true;
 }
 
-// ---------- GNSS 명령 전송 함수 ----------
 void sendCommandWithChecksum(const String &cmdBody) {
   byte checksum = 0;
   for (int i = 0; i < cmdBody.length(); i++) checksum ^= cmdBody[i];
@@ -53,20 +52,46 @@ void sendCommandWithChecksum(const String &cmdBody) {
   Serial.print(command);
 }
 
+void enqueueLocation(float lat, float lng) {
+  if (queueCount >= MAX_QUEUE_SIZE) {
+    queueStart = (queueStart + 1) % MAX_QUEUE_SIZE;
+    queueCount--;
+  }
+  char buf[40];
+  snprintf(buf, sizeof(buf), "%.8f,%.8f", lat, lng);
+  locationQueue[queueEnd] = String(buf);
+  queueEnd = (queueEnd + 1) % MAX_QUEUE_SIZE;
+  queueCount++;
+}
+
+void processLocationQueue() {
+  if (queueCount > 0) {
+    String msg = locationQueue[queueStart];
+    queueStart = (queueStart + 1) % MAX_QUEUE_SIZE;
+    queueCount--;
+
+    radio.standby();
+    int state = radio.transmit((uint8_t *)msg.c_str(), msg.length());
+    if (state == RADIOLIB_ERR_NONE) {
+      radio.finishTransmit();
+      Serial.println("[LoRa] \U0001f4e8 send: " + msg);
+    } else {
+      Serial.printf("[LoRa] \u274c 전송 실패 (%d)\n", state);
+    }
+    radio.startReceive();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
-  delay(300);
-  Serial.println("=== RTCM 수신기 + GNSS 설정 시작 ===");
-
-  // ---------- GNSS UART 시작 ----------
   GNSS.begin(115200, SERIAL_8N1, RX_GNSS, TX_GNSS);
   delay(300);
 
-  // ---------- LoRa 초기화 ----------
   customSPI.begin(CUSTOM_SCLK, CUSTOM_MISO, CUSTOM_MOSI, CUSTOM_NSS);
   if (radio.begin() != RADIOLIB_ERR_NONE) {
-    Serial.println("[LoRa] ❌ 초기화 실패");
-    while (true);
+    Serial.println("[LoRa] \u274c 초기화 실패");
+    while (true)
+      ;
   }
 
   radio.setOutputPower(13);
@@ -75,63 +100,57 @@ void setup() {
   radio.setSpreadingFactor(7);
   radio.setPacketReceivedAction(setFlag);
   radio.startReceive();
-  Serial.println("[LoRa] 수신 대기 중...");
+  Serial.println("[LoRa] \U0001f7e2 수신 대기 시작");
 
-  // ---------- GNSS 설정 ----------
   delay(500);
-  sendCommandWithChecksum("PQTMCFGRCVRMODE,W,1");     // RTK Rover 모드
+  sendCommandWithChecksum("PQTMCFGRCVRMODE,W,1");
   delay(100);
-  sendCommandWithChecksum("PQTMCFGFIXRATE,W,1000");   // 위치 고정 주기 1Hz
+  sendCommandWithChecksum("PQTMCFGFIXRATE,W,1000");
   delay(100);
-  sendCommandWithChecksum("PQTMSAVEPAR");             // 설정 저장
+  sendCommandWithChecksum("PQTMSAVEPAR");
   delay(100);
-  sendCommandWithChecksum("PQTMGNSSSTART");           // GNSS 시작
+  sendCommandWithChecksum("PQTMGNSSSTART");
 }
 
 void loop() {
-  // ---------- RTCM 수신 처리 ----------
   if (receivedFlag) {
     receivedFlag = false;
 
     uint8_t buffer[256];
     int state = radio.readData(buffer, sizeof(buffer));
-
     if (state == RADIOLIB_ERR_NONE) {
       size_t packetLen = radio.getPacketLength();
+      if (packetLen > 4 && streamLen + packetLen - 4 < MAX_STREAM_SIZE) {
+        memcpy(streamBuffer + streamLen, buffer + 4, packetLen - 4);
+        streamLen += packetLen - 4;
+        lastPacketTime = millis();
 
-      if (packetLen > 4) {
-        if (streamLen == 0) memset(streamBuffer, 0, MAX_STREAM_SIZE);
-
-        if (streamLen + packetLen - 4 < MAX_STREAM_SIZE) {
-          memcpy(streamBuffer + streamLen, buffer + 4, packetLen - 4);
-          streamLen += packetLen - 4;
-          lastPacketTime = millis();
-        } else {
-          Serial.println("[❌] streamBuffer overflow! 초기화");
+        if (buffer[3] & 0x80) {  // 최종 청크 표시 플래그 (예: 0x80)
+          Serial.printf("[RTCM] \u2705 최종청크 수신 (%zu bytes)\n", streamLen);
+          for (size_t i = 0; i < streamLen; i++) {
+            GNSS.write(streamBuffer[i]);
+          }
           streamLen = 0;
+          processLocationQueue();  // 마지막 청크 받은 후 위치 송신
         }
-      }
-    } else {
-      Serial.printf("[LoRa] ❌ 수신 실패 (%d)\n", state);
-    }
 
+      } else {
+        Serial.println("[\u274c] RTCM 버퍼 오버플로우");
+        streamLen = 0;
+      }
+    }
     radio.startReceive();
   }
 
-  if (streamLen > 0 && millis() - lastPacketTime > PACKET_TIMEOUT_MS) {
-    Serial.printf("[RTCM] ✅ chunk 수신 완료 (%zu bytes)\n", streamLen);
-    for (size_t i = 0; i < streamLen; i++) {
-      GNSS.write(streamBuffer[i]);
-    }
+  if (streamLen > 0 && millis() - lastPacketTime > 1000) {
+    Serial.println("[\u26a0\ufe0f] RTCM 누적 데이터 오래됨 \u2192 초기화");
     streamLen = 0;
   }
 
-  // ---------- GNSS 수신 & TinyGPS++ 파싱 ----------
   while (GNSS.available()) {
     char c = GNSS.read();
     gps.encode(c);
 
-    // 동시에 GGA 문장도 수집 (RTK Fix 확인용)
     if (c == '\n') {
       if (nmeaLine.startsWith("$GNGGA")) {
         int fixIndex = 0;
@@ -146,15 +165,8 @@ void loop() {
         int fixType = nmeaLine.substring(fixIndex, fixIndex + 1).toInt();
 
         if (gps.location.isValid()) {
-          Serial.printf("[location] %.8f,%.8f | Fix: %d ",
-                        gps.location.lat(), gps.location.lng(), fixType);
-          switch (fixType) {
-            case 1: Serial.println("(GPS)"); break;
-            case 2: Serial.println("(DGPS)"); break;
-            case 4: Serial.println("(RTK Fixed ✅)"); break;
-            case 5: Serial.println("(RTK Float ⚠️)"); break;
-            default: Serial.println("(Unknown)"); break;
-          }
+          Serial.printf("[GPS] %.8f, %.8f | Fix: %d\n", gps.location.lat(), gps.location.lng(), fixType);
+          enqueueLocation(gps.location.lat(), gps.location.lng());
         }
       }
       nmeaLine = "";
