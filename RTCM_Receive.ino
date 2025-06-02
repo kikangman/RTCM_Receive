@@ -1,7 +1,7 @@
 //git kikangman
 /*
 cd /Users/kikang/Desktop/ki/summershot/RTK/RTCM_Receive
-./save_push.sh
+./save_push.sh "??"
 */
 
 #include <RadioLib.h>
