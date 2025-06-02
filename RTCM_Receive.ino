@@ -118,7 +118,7 @@ void loop() {
   }
 
   if (streamLen > 0 && millis() - lastPacketTime > PACKET_TIMEOUT_MS) {
-    Serial.printf("\n[RTCM] ✅ chunk 수신 완료 (%zu bytes)\n", streamLen);
+    Serial.printf("[RTCM] ✅ chunk 수신 완료 (%zu bytes)\n", streamLen);
     for (size_t i = 0; i < streamLen; i++) {
       GNSS.write(streamBuffer[i]);
     }
