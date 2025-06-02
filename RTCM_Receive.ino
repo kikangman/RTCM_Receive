@@ -4,8 +4,6 @@ cd /Users/kikang/Desktop/ki/summershot/RTK/RTCM_Receive
 ./save_push.sh "??"
 
 */
-
-
 #include <RadioLib.h>
 #include <TinyGPS++.h>
 
@@ -28,6 +26,7 @@ TinyGPSPlus gps;
 const int MAX_QUEUE_SIZE = 10;
 String locationQueue[MAX_QUEUE_SIZE];
 int queueStart = 0, queueEnd = 0, queueCount = 0;
+int lastFixType = 0;
 
 #define MAX_STREAM_SIZE 8192
 uint8_t streamBuffer[MAX_STREAM_SIZE];
@@ -65,8 +64,16 @@ void enqueueLocation(float lat, float lng) {
 }
 
 void processLocationQueue() {
-  if (queueCount > 0) {
-    String msg = locationQueue[queueStart];
+  if (queueCount > 0 && gps.time.isValid()) {
+    String msg;
+
+    char timeStr[10];
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
+
+    String latStr = String(gps.location.lat(), 8);
+    String lonStr = String(gps.location.lng(), 8);
+    msg = String(timeStr) + "," + latStr + "," + lonStr + "," + String(lastFixType);
+
     queueStart = (queueStart + 1) % MAX_QUEUE_SIZE;
     queueCount--;
 
@@ -74,9 +81,9 @@ void processLocationQueue() {
     int state = radio.transmit((uint8_t *)msg.c_str(), msg.length());
     if (state == RADIOLIB_ERR_NONE) {
       radio.finishTransmit();
-      Serial.println("[LoRa] \U0001f4e8 send: " + msg);
+      Serial.println("[LoRa] 📨 send: " + msg);
     } else {
-      Serial.printf("[LoRa] \u274c 전송 실패 (%d)\n", state);
+      Serial.printf("[LoRa] ❌ 전송 실패 (%d)\n", state);
     }
     radio.startReceive();
   }
@@ -89,7 +96,7 @@ void setup() {
 
   customSPI.begin(CUSTOM_SCLK, CUSTOM_MISO, CUSTOM_MOSI, CUSTOM_NSS);
   if (radio.begin() != RADIOLIB_ERR_NONE) {
-    Serial.println("[LoRa] \u274c 초기화 실패");
+    Serial.println("[LoRa] ❌ 초기화 실패");
     while (true)
       ;
   }
@@ -100,7 +107,7 @@ void setup() {
   radio.setSpreadingFactor(7);
   radio.setPacketReceivedAction(setFlag);
   radio.startReceive();
-  Serial.println("[LoRa] \U0001f7e2 수신 대기 시작");
+  Serial.println("[LoRa] 🟢 수신 대기 시작");
 
   delay(500);
   sendCommandWithChecksum("PQTMCFGRCVRMODE,W,1");
@@ -125,17 +132,16 @@ void loop() {
         streamLen += packetLen - 4;
         lastPacketTime = millis();
 
-        if (buffer[3] & 0x80) {  // 최종 청크 표시 플래그 (예: 0x80)
-          Serial.printf("[RTCM] \u2705 최종청크 수신 (%zu bytes)\n", streamLen);
+        if (buffer[3] & 0x80) {
+          Serial.printf("[RTCM] ✅ 최종청크 수신 (%zu bytes)\n", streamLen);
           for (size_t i = 0; i < streamLen; i++) {
             GNSS.write(streamBuffer[i]);
           }
           streamLen = 0;
-          processLocationQueue();  // 마지막 청크 받은 후 위치 송신
+          processLocationQueue();
         }
-
       } else {
-        Serial.println("[\u274c] RTCM 버퍼 오버플로우");
+        Serial.println("[❌] RTCM 버퍼 오버플로우");
         streamLen = 0;
       }
     }
@@ -143,7 +149,7 @@ void loop() {
   }
 
   if (streamLen > 0 && millis() - lastPacketTime > 1000) {
-    Serial.println("[\u26a0\ufe0f] RTCM 누적 데이터 오래됨 \u2192 초기화");
+    Serial.println("[⚠️] RTCM 누적 데이터 오래됨 → 초기화");
     streamLen = 0;
   }
 
@@ -163,9 +169,14 @@ void loop() {
           }
         }
         int fixType = nmeaLine.substring(fixIndex, fixIndex + 1).toInt();
+        lastFixType = fixType;
 
         if (gps.location.isValid()) {
-          Serial.printf("[GPS] %.8f, %.8f | Fix: %d\n", gps.location.lat(), gps.location.lng(), fixType);
+          char timeStr[10] = "??:??:??";
+          if (gps.time.isValid()) {
+            snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
+          }
+          Serial.printf("[GPS] %s | %.8f, %.8f | Fix: %d\n", timeStr, gps.location.lat(), gps.location.lng(), fixType);
           enqueueLocation(gps.location.lat(), gps.location.lng());
         }
       }
